@@ -2,7 +2,9 @@
     "name": "com.amari-noa.unitypackage-pipeline-core.editor",
     "rootNamespace": "com.amari_noa.unitypackage_pipeline_core.editor",
     "references": [],
-    "includePlatforms": [],
+    "includePlatforms": [
+        "Editor"
+    ],
     "excludePlatforms": [],
     "allowUnsafeCode": false,
     "overrideReferences": false,
