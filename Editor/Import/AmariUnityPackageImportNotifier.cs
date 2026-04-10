@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 
 namespace com.amari_noa.unitypackage_pipeline_core.editor
 {
@@ -20,6 +21,7 @@ namespace com.amari_noa.unitypackage_pipeline_core.editor
                 return true;
             }
 
+            List<string> errors = null;
             foreach (Action<AmariUnityPackageImportResultContext> handler in _importRequestFinalized.GetInvocationList())
             {
                 try
@@ -28,12 +30,25 @@ namespace com.amari_noa.unitypackage_pipeline_core.editor
                 }
                 catch (Exception ex)
                 {
-                    error = ex.Message;
-                    return false;
+                    if (errors == null)
+                    {
+                        errors = new List<string>();
+                    }
+
+                    if (!string.IsNullOrWhiteSpace(ex.Message))
+                    {
+                        errors.Add(ex.Message);
+                    }
                 }
             }
 
-            return true;
+            if (errors == null || errors.Count == 0)
+            {
+                return true;
+            }
+
+            error = string.Join(" | ", errors);
+            return false;
         }
     }
 }

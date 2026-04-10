@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using UnityEditor;
 using UnityEngine;
+using UnityEngine.UIElements;
 
 namespace com.amari_noa.unitypackage_pipeline_core.editor
 {
@@ -18,6 +19,14 @@ namespace com.amari_noa.unitypackage_pipeline_core.editor
 
     public sealed class AmariUnityPackageImportPipelineService : IAmariUnityPackageImportPipelineService, IDisposable
     {
+        private const int PersistStateDebounceMilliseconds = 500;
+        private const int ClosedWindowFallbackDecisionFrames = 30;
+        private static readonly string[] PackageImportWindowTypeNames =
+        {
+            "UnityEditor.PackageImport",
+            "UnityEditor.PackageImportWindow"
+        };
+
         private readonly AmariUnityPackageImportQueue _queue;
         private readonly AmariUnityPackageImportStateStore _stateStore;
         private readonly AmariUnityPackageImportRunner _runner;
@@ -34,6 +43,23 @@ namespace com.amari_noa.unitypackage_pipeline_core.editor
         private bool _isDisposed;
         private bool _isImporting;
         private bool _interactiveMode = true;
+        private AmariUnityPackagePreImportAnalysisMode _preImportAnalysisMode = AmariUnityPackagePreImportAnalysisMode.Full;
+        private bool _quietMode;
+        private bool _queueChangedPendingInQuietMode;
+        private bool _persistStateScheduled;
+        private long _persistStateDeadlineUtcTicks;
+        private Type[] _packageImportWindowTypes = Array.Empty<Type>();
+        private bool _interactiveImportMonitorSubscribed;
+        private bool _currentRequestFinalized;
+        private bool _currentRequestImportExecutionObserved;
+        private bool _currentRequestTerminalEventReceived;
+        private bool _currentRequestObservedPackageImportWindowOpen;
+        private bool _currentRequestObservedPackageImportWindowClose;
+        private int _currentRequestWindowClosedWithoutTerminalEventUpdateCount;
+        private readonly HashSet<int> _trackedPackageImportWindowIds = new HashSet<int>();
+        private readonly Dictionary<int, VisualElement> _trackedPackageImportWindowRoots = new Dictionary<int, VisualElement>();
+        private readonly Dictionary<int, EventCallback<DetachFromPanelEvent>> _trackedPackageImportWindowDetachCallbacks =
+            new Dictionary<int, EventCallback<DetachFromPanelEvent>>();
 
         public bool IsImporting => _isImporting;
         public int RemainingCount => _queue.Count;
@@ -46,6 +72,30 @@ namespace com.amari_noa.unitypackage_pipeline_core.editor
             {
                 _interactiveMode = value;
                 PersistState();
+            }
+        }
+
+        public AmariUnityPackagePreImportAnalysisMode PreImportAnalysisMode
+        {
+            get => _preImportAnalysisMode;
+            set => _preImportAnalysisMode = value;
+        }
+
+        public bool QuietMode
+        {
+            get => _quietMode;
+            set
+            {
+                if (_quietMode == value)
+                {
+                    return;
+                }
+
+                _quietMode = value;
+                if (!_quietMode && _queueChangedPendingInQuietMode)
+                {
+                    RaiseQueueChanged(force: true);
+                }
             }
         }
 
@@ -98,8 +148,11 @@ namespace com.amari_noa.unitypackage_pipeline_core.editor
             _eventBridge.ImportCompleted += OnImportCompleted;
             _eventBridge.ImportFailed += OnImportFailed;
             _eventBridge.ImportCancelled += OnImportCancelled;
+            _eventBridge.ImportStarted += OnImportStarted;
             _eventBridge.AssetsPostprocessed += OnAssetsPostprocessed;
             _eventBridge.Subscribe();
+            AssemblyReloadEvents.beforeAssemblyReload += OnBeforeAssemblyReload;
+            EditorApplication.quitting += OnEditorQuitting;
 
             LoadPersistedState();
         }
@@ -182,6 +235,20 @@ namespace com.amari_noa.unitypackage_pipeline_core.editor
             var wasImporting = _isImporting;
             var wasRunnerRunning = _runner.IsRunning;
 
+            if (TryFinalizeCurrentRequest(
+                    AmariUnityPackagePipelineOperationStatus.Cancelled,
+                    "Import queue reset by pipeline request.",
+                    clearRemainingQueue: true,
+                    reason: nameof(ResetPipelineAndClearQueue)))
+            {
+                LogWarning(
+                    $"Pipeline reset finalized active request. remainingBefore={remainingBefore}, " +
+                    $"wasImporting={wasImporting.ToString().ToLowerInvariant()}, " +
+                    $"wasRunnerRunning={wasRunnerRunning.ToString().ToLowerInvariant()}");
+                return;
+            }
+
+            StopInteractiveImportWindowMonitor();
             _runner.CompleteCurrent();
             _assetTracker.EndTracking();
             _currentContext = null;
@@ -189,12 +256,12 @@ namespace com.amari_noa.unitypackage_pipeline_core.editor
             _isImporting = false;
             _queue.Clear();
 
-            PersistState();
+            PersistStateNow();
             RaiseQueueChanged();
 
-            Debug.LogWarning(
-                $"{AmariUnityPackagePipelineLabels.LogPrefix} Pipeline reset requested. " +
-                $"remainingBefore={remainingBefore}, wasImporting={wasImporting.ToString().ToLowerInvariant()}, " +
+            LogWarning(
+                $"Pipeline reset requested. remainingBefore={remainingBefore}, " +
+                $"wasImporting={wasImporting.ToString().ToLowerInvariant()}, " +
                 $"wasRunnerRunning={wasRunnerRunning.ToString().ToLowerInvariant()}");
         }
 
@@ -205,12 +272,27 @@ namespace com.amari_noa.unitypackage_pipeline_core.editor
                 return;
             }
 
-            Debug.LogWarning($"{AmariUnityPackagePipelineLabels.LogPrefix} Stale importing state detected in {caller}. Recovering internal state.");
+            if (_currentContext == null && _queue.TryPeek(out var staleRequest))
+            {
+                _currentContext = new AmariUnityPackageImportContext(staleRequest, _currentTags, _interactiveMode);
+            }
+
+            if (TryFinalizeCurrentRequest(
+                    AmariUnityPackagePipelineOperationStatus.Cancelled,
+                    $"Import was cancelled while recovering stale pipeline state: {caller}",
+                    clearRemainingQueue: true,
+                    reason: $"StaleRecovery({caller})"))
+            {
+                return;
+            }
+
+            LogWarning($"Stale importing state detected in {caller}. Recovering internal state.");
+            StopInteractiveImportWindowMonitor();
             _assetTracker.EndTracking();
             _currentContext = null;
             _currentTags = Array.Empty<string>();
             _isImporting = false;
-            PersistState();
+            PersistStateNow();
             RaiseQueueChanged();
         }
 
@@ -236,10 +318,16 @@ namespace com.amari_noa.unitypackage_pipeline_core.editor
                 return;
             }
 
+            PersistStateNow();
             _isDisposed = true;
+            StopInteractiveImportWindowMonitor();
+            EditorApplication.delayCall -= FlushScheduledPersistState;
+            AssemblyReloadEvents.beforeAssemblyReload -= OnBeforeAssemblyReload;
+            EditorApplication.quitting -= OnEditorQuitting;
             _eventBridge.ImportCompleted -= OnImportCompleted;
             _eventBridge.ImportFailed -= OnImportFailed;
             _eventBridge.ImportCancelled -= OnImportCancelled;
+            _eventBridge.ImportStarted -= OnImportStarted;
             _eventBridge.AssetsPostprocessed -= OnAssetsPostprocessed;
             _eventBridge.Dispose();
         }
@@ -263,7 +351,7 @@ namespace com.amari_noa.unitypackage_pipeline_core.editor
             else if (_isImporting && _queue.Count == 0)
             {
                 _isImporting = false;
-                PersistState();
+                PersistStateNow();
             }
 
             RaiseQueueChanged();
@@ -290,7 +378,7 @@ namespace com.amari_noa.unitypackage_pipeline_core.editor
             if (!_queue.TryPeek(out var request))
             {
                 _isImporting = false;
-                PersistState();
+                PersistStateNow();
                 RaiseQueueChanged();
                 return;
             }
@@ -299,30 +387,42 @@ namespace com.amari_noa.unitypackage_pipeline_core.editor
             {
                 _currentContext = new AmariUnityPackageImportContext(request, Array.Empty<string>(), _interactiveMode);
                 _currentTags = Array.Empty<string>();
-                FinalizeCurrentRequest(AmariUnityPackagePipelineOperationStatus.Failed, validationError);
+                BeginCurrentRequestLifecycleState();
+                TryFinalizeCurrentRequest(
+                    AmariUnityPackagePipelineOperationStatus.Failed,
+                    validationError,
+                    clearRemainingQueue: false,
+                    reason: "TagValidationFailed");
                 return;
             }
 
-            if (TryFinalizeNoChangeRequest(request, normalizedTags))
+            if (_preImportAnalysisMode != AmariUnityPackagePreImportAnalysisMode.Skip &&
+                TryFinalizeNoChangeRequest(request, normalizedTags))
             {
                 return;
             }
 
             _currentContext = new AmariUnityPackageImportContext(request, normalizedTags, _interactiveMode);
             _currentTags = normalizedTags;
+            BeginCurrentRequestLifecycleState();
             _assetTracker.BeginTracking(_currentContext);
             _hookDispatcher.DispatchBefore(_currentContext);
 
             _isImporting = true;
             PersistState();
             RaiseQueueChanged();
+            BeginInteractiveImportWindowMonitor();
 
             if (_runner.TryStartImport(request.PackagePath, _interactiveMode, out var startError))
             {
                 return;
             }
 
-            FinalizeCurrentRequest(AmariUnityPackagePipelineOperationStatus.Failed, startError);
+            TryFinalizeCurrentRequest(
+                AmariUnityPackagePipelineOperationStatus.Failed,
+                startError,
+                clearRemainingQueue: false,
+                reason: "ImportRunnerStartFailed");
         }
 
         private void OnImportCompleted(string packageName)
@@ -332,16 +432,25 @@ namespace com.amari_noa.unitypackage_pipeline_core.editor
                 return;
             }
 
+            _currentRequestTerminalEventReceived = true;
             _hookDispatcher.DispatchCompleted(_currentContext);
 
             var importedAssets = _assetTracker.GetImportedAssetsSnapshot();
             if (!_tagService.TryApplyTags(importedAssets, _currentTags, out var tagError))
             {
-                FinalizeCurrentRequest(AmariUnityPackagePipelineOperationStatus.Failed, tagError);
+                TryFinalizeCurrentRequest(
+                    AmariUnityPackagePipelineOperationStatus.Failed,
+                    tagError,
+                    clearRemainingQueue: false,
+                    reason: "TagApplyFailedAfterImportCompleted");
                 return;
             }
 
-            FinalizeCurrentRequest(AmariUnityPackagePipelineOperationStatus.Completed, string.Empty);
+            TryFinalizeCurrentRequest(
+                AmariUnityPackagePipelineOperationStatus.Completed,
+                string.Empty,
+                clearRemainingQueue: false,
+                reason: "ImportCompleted");
         }
 
         private void OnImportFailed(string packageName, string error)
@@ -351,10 +460,27 @@ namespace com.amari_noa.unitypackage_pipeline_core.editor
                 return;
             }
 
+            _currentRequestTerminalEventReceived = true;
             var message = string.IsNullOrWhiteSpace(error)
                 ? $"Import failed: {packageName}"
                 : error;
-            FinalizeCurrentRequest(AmariUnityPackagePipelineOperationStatus.Failed, message);
+            TryFinalizeCurrentRequest(
+                AmariUnityPackagePipelineOperationStatus.Failed,
+                message,
+                clearRemainingQueue: false,
+                reason: "ImportFailed");
+        }
+
+        private void OnImportStarted(string packageName)
+        {
+            if (!_isImporting || _currentContext == null)
+            {
+                return;
+            }
+
+            _ = packageName;
+            // importPackageStarted can fire before the user confirms Import,
+            // so it must not suppress the close-window fallback.
         }
 
         private void OnImportCancelled(string packageName)
@@ -364,13 +490,15 @@ namespace com.amari_noa.unitypackage_pipeline_core.editor
                 return;
             }
 
+            _currentRequestTerminalEventReceived = true;
             var message = string.IsNullOrWhiteSpace(packageName)
                 ? "Import cancelled."
                 : $"Import cancelled: {packageName}";
-            FinalizeCurrentRequest(
-                AmariUnityPackagePipelineOperationStatus.Failed,
+            TryFinalizeCurrentRequest(
+                AmariUnityPackagePipelineOperationStatus.Cancelled,
                 message,
-                clearRemainingQueue: true);
+                clearRemainingQueue: true,
+                reason: "ImportCancelled");
         }
 
         private void OnAssetsPostprocessed(string[] importedAssets)
@@ -380,7 +508,46 @@ namespace com.amari_noa.unitypackage_pipeline_core.editor
                 return;
             }
 
+            _currentRequestImportExecutionObserved = true;
             _assetTracker.RecordImportedAssets(importedAssets);
+        }
+
+        private void BeginCurrentRequestLifecycleState()
+        {
+            StopInteractiveImportWindowMonitor();
+            _currentRequestFinalized = false;
+            _currentRequestImportExecutionObserved = false;
+            _currentRequestTerminalEventReceived = false;
+            _currentRequestObservedPackageImportWindowOpen = false;
+            _currentRequestObservedPackageImportWindowClose = false;
+            _currentRequestWindowClosedWithoutTerminalEventUpdateCount = 0;
+        }
+
+        private bool TryFinalizeCurrentRequest(
+            AmariUnityPackagePipelineOperationStatus status,
+            string errorMessage,
+            bool clearRemainingQueue,
+            string reason)
+        {
+            _ = reason;
+            if (_currentRequestFinalized)
+            {
+                return false;
+            }
+
+            if (_currentContext == null && _queue.TryPeek(out var pendingRequest))
+            {
+                _currentContext = new AmariUnityPackageImportContext(pendingRequest, _currentTags, _interactiveMode);
+            }
+
+            if (_currentContext == null)
+            {
+                return false;
+            }
+
+            _currentRequestFinalized = true;
+            FinalizeCurrentRequest(status, errorMessage, clearRemainingQueue);
+            return true;
         }
 
         private void FinalizeCurrentRequest(
@@ -413,7 +580,7 @@ namespace com.amari_noa.unitypackage_pipeline_core.editor
             if (clearRemainingQueue && _queue.Count > 0)
             {
                 _queue.Clear();
-                Debug.LogWarning($"{AmariUnityPackagePipelineLabels.LogPrefix} Queue cleared due to cancelled package import.");
+                LogWarning("Queue cleared due to cancelled package import.");
             }
 
             CleanupCurrentRequestState();
@@ -430,19 +597,355 @@ namespace com.amari_noa.unitypackage_pipeline_core.editor
 
             if (!shouldContinue && _queue.Count > 0)
             {
-                Debug.LogWarning($"{AmariUnityPackagePipelineLabels.LogPrefix} Queue stopped due to import error. Remaining requests: {_queue.Count}");
+                LogWarning($"Queue stopped due to import error. Remaining requests: {_queue.Count}");
             }
         }
 
         private void CleanupCurrentRequestState()
         {
+            StopInteractiveImportWindowMonitor();
             _runner.CompleteCurrent();
             _assetTracker.EndTracking();
             _currentContext = null;
             _currentTags = Array.Empty<string>();
             _isImporting = false;
-            PersistState();
+            _currentRequestFinalized = false;
+            _currentRequestImportExecutionObserved = false;
+            _currentRequestTerminalEventReceived = false;
+            _currentRequestObservedPackageImportWindowOpen = false;
+            _currentRequestObservedPackageImportWindowClose = false;
+            _currentRequestWindowClosedWithoutTerminalEventUpdateCount = 0;
+            PersistStateNow();
             RaiseQueueChanged();
+        }
+
+        private void BeginInteractiveImportWindowMonitor()
+        {
+            if (_isDisposed || !_interactiveMode)
+            {
+                StopInteractiveImportWindowMonitor();
+                return;
+            }
+
+            ResolvePackageImportWindowTypes();
+            if (_packageImportWindowTypes.Length == 0)
+            {
+                StopInteractiveImportWindowMonitor();
+                return;
+            }
+
+            if (_interactiveImportMonitorSubscribed)
+            {
+                return;
+            }
+
+            EditorApplication.update += MonitorInteractiveImportWindow;
+            _interactiveImportMonitorSubscribed = true;
+        }
+
+        private void StopInteractiveImportWindowMonitor()
+        {
+            StopTrackingPackageImportWindows(markClosedObserved: false);
+            _currentRequestObservedPackageImportWindowOpen = false;
+            _currentRequestObservedPackageImportWindowClose = false;
+            _currentRequestWindowClosedWithoutTerminalEventUpdateCount = 0;
+            if (!_interactiveImportMonitorSubscribed)
+            {
+                return;
+            }
+
+            EditorApplication.update -= MonitorInteractiveImportWindow;
+            _interactiveImportMonitorSubscribed = false;
+        }
+
+        private void MonitorInteractiveImportWindow()
+        {
+            if (_isDisposed || !_isImporting || _currentContext == null || !_interactiveMode || _currentRequestFinalized)
+            {
+                StopInteractiveImportWindowMonitor();
+                return;
+            }
+
+            ResolvePackageImportWindowTypes();
+            if (_packageImportWindowTypes.Length == 0)
+            {
+                StopInteractiveImportWindowMonitor();
+                return;
+            }
+
+            var openWindows = GetOpenPackageImportWindows();
+            SyncTrackedPackageImportWindows(openWindows);
+            if (_trackedPackageImportWindowIds.Count > 0)
+            {
+                _currentRequestObservedPackageImportWindowClose = false;
+                _currentRequestWindowClosedWithoutTerminalEventUpdateCount = 0;
+                return;
+            }
+
+            if (_currentRequestTerminalEventReceived)
+            {
+                StopInteractiveImportWindowMonitor();
+                return;
+            }
+
+            if (_currentRequestImportExecutionObserved)
+            {
+                StopInteractiveImportWindowMonitor();
+                return;
+            }
+
+            // Keep waiting while Unity is actively importing/updating assets.
+            // This prevents premature fallback-cancel after pressing Import.
+            if (EditorApplication.isUpdating)
+            {
+                _currentRequestImportExecutionObserved = true;
+                _currentRequestWindowClosedWithoutTerminalEventUpdateCount = 0;
+                return;
+            }
+
+            if (!_currentRequestObservedPackageImportWindowOpen || !_currentRequestObservedPackageImportWindowClose)
+            {
+                _currentRequestWindowClosedWithoutTerminalEventUpdateCount = 0;
+                return;
+            }
+
+            _currentRequestWindowClosedWithoutTerminalEventUpdateCount++;
+            if (_currentRequestWindowClosedWithoutTerminalEventUpdateCount < ClosedWindowFallbackDecisionFrames)
+            {
+                return;
+            }
+
+            var message = string.IsNullOrWhiteSpace(_currentContext.Request?.PackagePath)
+                ? "Import cancelled by closing the Package Import window."
+                : $"Import cancelled by closing the Package Import window: {_currentContext.Request.PackagePath}";
+            TryFinalizeCurrentRequest(
+                AmariUnityPackagePipelineOperationStatus.Cancelled,
+                message,
+                clearRemainingQueue: true,
+                reason: "PackageImportWindowClosedWithoutTerminalEvent");
+        }
+
+        private UnityEngine.Object[] GetOpenPackageImportWindows()
+        {
+            if (_packageImportWindowTypes == null || _packageImportWindowTypes.Length == 0)
+            {
+                return Array.Empty<UnityEngine.Object>();
+            }
+
+            try
+            {
+                var windowsById = new Dictionary<int, UnityEngine.Object>();
+                for (var i = 0; i < _packageImportWindowTypes.Length; i++)
+                {
+                    var windowType = _packageImportWindowTypes[i];
+                    if (windowType == null)
+                    {
+                        continue;
+                    }
+
+                    var windows = Resources.FindObjectsOfTypeAll(windowType);
+                    if (windows == null || windows.Length == 0)
+                    {
+                        continue;
+                    }
+
+                    for (var j = 0; j < windows.Length; j++)
+                    {
+                        var window = windows[j];
+                        if (window == null)
+                        {
+                            continue;
+                        }
+
+                        windowsById[window.GetInstanceID()] = window;
+                    }
+                }
+
+                if (windowsById.Count == 0)
+                {
+                    return Array.Empty<UnityEngine.Object>();
+                }
+
+                var dedupedWindows = new UnityEngine.Object[windowsById.Count];
+                var index = 0;
+                foreach (var pair in windowsById)
+                {
+                    dedupedWindows[index] = pair.Value;
+                    index++;
+                }
+
+                return dedupedWindows;
+            }
+            catch
+            {
+                return Array.Empty<UnityEngine.Object>();
+            }
+        }
+
+        private void ResolvePackageImportWindowTypes()
+        {
+            if (_packageImportWindowTypes.Length > 0)
+            {
+                return;
+            }
+
+            var types = new List<Type>(PackageImportWindowTypeNames.Length);
+            for (var i = 0; i < PackageImportWindowTypeNames.Length; i++)
+            {
+                var typeName = PackageImportWindowTypeNames[i];
+                if (string.IsNullOrWhiteSpace(typeName))
+                {
+                    continue;
+                }
+
+                var type = typeof(Editor).Assembly.GetType(typeName);
+                if (type != null)
+                {
+                    types.Add(type);
+                }
+            }
+
+            if (types.Count == 0)
+            {
+                try
+                {
+                    var editorAssemblyTypes = typeof(Editor).Assembly.GetTypes();
+                    for (var i = 0; i < editorAssemblyTypes.Length; i++)
+                    {
+                        var type = editorAssemblyTypes[i];
+                        if (type == null ||
+                            !typeof(EditorWindow).IsAssignableFrom(type) ||
+                            string.IsNullOrWhiteSpace(type.FullName) ||
+                            type.FullName.IndexOf("PackageImport", StringComparison.OrdinalIgnoreCase) < 0)
+                        {
+                            continue;
+                        }
+
+                        types.Add(type);
+                    }
+                }
+                catch
+                {
+                    // ignored
+                }
+            }
+
+            _packageImportWindowTypes = types.ToArray();
+        }
+
+        private void SyncTrackedPackageImportWindows(IReadOnlyList<UnityEngine.Object> openWindows)
+        {
+            var currentOpenIds = new HashSet<int>();
+            if (openWindows != null)
+            {
+                for (var i = 0; i < openWindows.Count; i++)
+                {
+                    var windowObj = openWindows[i];
+                    if (windowObj == null)
+                    {
+                        continue;
+                    }
+
+                    var instanceId = windowObj.GetInstanceID();
+                    currentOpenIds.Add(instanceId);
+                    if (_trackedPackageImportWindowIds.Contains(instanceId))
+                    {
+                        continue;
+                    }
+
+                    TrackPackageImportWindow(windowObj, instanceId);
+                }
+            }
+
+            if (_trackedPackageImportWindowIds.Count == 0)
+            {
+                return;
+            }
+
+            var closedWindowIds = new List<int>();
+            foreach (var trackedId in _trackedPackageImportWindowIds)
+            {
+                if (!currentOpenIds.Contains(trackedId))
+                {
+                    closedWindowIds.Add(trackedId);
+                }
+            }
+
+            for (var i = 0; i < closedWindowIds.Count; i++)
+            {
+                UntrackPackageImportWindow(closedWindowIds[i], markClosedObserved: true);
+            }
+        }
+
+        private void TrackPackageImportWindow(UnityEngine.Object windowObj, int windowId)
+        {
+            if (!_trackedPackageImportWindowIds.Add(windowId))
+            {
+                return;
+            }
+
+            _currentRequestObservedPackageImportWindowOpen = true;
+
+            if (windowObj is not EditorWindow editorWindow)
+            {
+                return;
+            }
+
+            var root = editorWindow.rootVisualElement;
+            if (root == null)
+            {
+                return;
+            }
+
+            EventCallback<DetachFromPanelEvent> detachCallback = _ => OnTrackedPackageImportWindowDetached(windowId);
+            root.RegisterCallback(detachCallback);
+            _trackedPackageImportWindowRoots[windowId] = root;
+            _trackedPackageImportWindowDetachCallbacks[windowId] = detachCallback;
+        }
+
+        private void OnTrackedPackageImportWindowDetached(int windowId)
+        {
+            UntrackPackageImportWindow(windowId, markClosedObserved: true);
+        }
+
+        private void UntrackPackageImportWindow(int windowId, bool markClosedObserved)
+        {
+            if (_trackedPackageImportWindowRoots.TryGetValue(windowId, out var root) &&
+                _trackedPackageImportWindowDetachCallbacks.TryGetValue(windowId, out var callback) &&
+                root != null &&
+                callback != null)
+            {
+                try
+                {
+                    root.UnregisterCallback(callback);
+                }
+                catch
+                {
+                    // ignored
+                }
+            }
+
+            _trackedPackageImportWindowRoots.Remove(windowId);
+            _trackedPackageImportWindowDetachCallbacks.Remove(windowId);
+            var removed = _trackedPackageImportWindowIds.Remove(windowId);
+            if (removed && markClosedObserved && _currentRequestObservedPackageImportWindowOpen)
+            {
+                _currentRequestObservedPackageImportWindowClose = true;
+            }
+        }
+
+        private void StopTrackingPackageImportWindows(bool markClosedObserved)
+        {
+            if (_trackedPackageImportWindowIds.Count == 0)
+            {
+                return;
+            }
+
+            var trackedIds = new List<int>(_trackedPackageImportWindowIds);
+            for (var i = 0; i < trackedIds.Count; i++)
+            {
+                UntrackPackageImportWindow(trackedIds[i], markClosedObserved);
+            }
         }
 
         private bool TryFinalizeNoChangeRequest(AmariUnityPackageImportRequest request, string[] normalizedTags)
@@ -452,9 +955,9 @@ namespace com.amari_noa.unitypackage_pipeline_core.editor
                     out var analysisResult,
                     out var analysisError))
             {
-                Debug.LogWarning(
-                    $"{AmariUnityPackagePipelineLabels.LogPrefix} Pre-import analysis failed. " +
-                    $"Falling back to normal import. packagePath={request.PackagePath}, reason={analysisError}");
+                LogWarning(
+                    $"Pre-import analysis failed. Falling back to normal import. " +
+                    $"packagePath={request.PackagePath}, reason={analysisError}");
                 return false;
             }
 
@@ -462,15 +965,14 @@ namespace com.amari_noa.unitypackage_pipeline_core.editor
             {
                 if (!string.IsNullOrWhiteSpace(analysisError))
                 {
-                    Debug.Log(
-                        $"{AmariUnityPackagePipelineLabels.LogPrefix} Pre-import analysis requires package import. " +
-                        $"packagePath={request.PackagePath}, reason={analysisError}");
+                    Log($"Pre-import analysis requires package import. packagePath={request.PackagePath}, reason={analysisError}");
                 }
                 return false;
             }
 
             _currentContext = new AmariUnityPackageImportContext(request, normalizedTags, _interactiveMode);
             _currentTags = normalizedTags ?? Array.Empty<string>();
+            BeginCurrentRequestLifecycleState();
             _assetTracker.BeginTracking(_currentContext);
             _hookDispatcher.DispatchBefore(_currentContext);
             _assetTracker.RecordImportedAssets(analysisResult.ExistingAssetPaths);
@@ -478,18 +980,74 @@ namespace com.amari_noa.unitypackage_pipeline_core.editor
 
             if (!_tagService.TryApplyTags(analysisResult.ExistingAssetPaths, _currentTags, out var tagError))
             {
-                FinalizeCurrentRequest(AmariUnityPackagePipelineOperationStatus.Failed, tagError);
+                TryFinalizeCurrentRequest(
+                    AmariUnityPackagePipelineOperationStatus.Failed,
+                    tagError,
+                    clearRemainingQueue: false,
+                    reason: "PreImportNoChangeTagApplyFailed");
                 return true;
             }
 
-            Debug.Log(
-                $"{AmariUnityPackagePipelineLabels.LogPrefix} Pre-import analysis detected no changes. " +
-                $"Skipping package import: {request.PackagePath}");
-            FinalizeCurrentRequest(AmariUnityPackagePipelineOperationStatus.Completed, string.Empty);
+            Log($"Pre-import analysis detected no changes. Skipping package import: {request.PackagePath}");
+            TryFinalizeCurrentRequest(
+                AmariUnityPackagePipelineOperationStatus.Completed,
+                string.Empty,
+                clearRemainingQueue: false,
+                reason: "PreImportNoChangeCompleted");
             return true;
         }
 
         private void PersistState()
+        {
+            if (_isDisposed)
+            {
+                return;
+            }
+
+            _persistStateDeadlineUtcTicks = DateTime.UtcNow.AddMilliseconds(PersistStateDebounceMilliseconds).Ticks;
+            if (_persistStateScheduled)
+            {
+                return;
+            }
+
+            _persistStateScheduled = true;
+            EditorApplication.delayCall += FlushScheduledPersistState;
+        }
+
+        private void PersistStateNow()
+        {
+            if (_isDisposed)
+            {
+                return;
+            }
+
+            _persistStateScheduled = false;
+            _persistStateDeadlineUtcTicks = 0L;
+            EditorApplication.delayCall -= FlushScheduledPersistState;
+            PersistStateImmediate();
+        }
+
+        private void FlushScheduledPersistState()
+        {
+            if (_isDisposed || !_persistStateScheduled)
+            {
+                _persistStateScheduled = false;
+                return;
+            }
+
+            var nowTicks = DateTime.UtcNow.Ticks;
+            if (nowTicks < _persistStateDeadlineUtcTicks)
+            {
+                EditorApplication.delayCall += FlushScheduledPersistState;
+                return;
+            }
+
+            _persistStateScheduled = false;
+            _persistStateDeadlineUtcTicks = 0L;
+            PersistStateImmediate();
+        }
+
+        private void PersistStateImmediate()
         {
             var state = new AmariUnityPackageImportPersistedState
             {
@@ -501,8 +1059,15 @@ namespace com.amari_noa.unitypackage_pipeline_core.editor
             _stateStore.Save(state);
         }
 
-        private void RaiseQueueChanged()
+        private void RaiseQueueChanged(bool force = false)
         {
+            if (!force && _quietMode && _queue.Count > 0)
+            {
+                _queueChangedPendingInQuietMode = true;
+                return;
+            }
+
+            _queueChangedPendingInQuietMode = false;
             try
             {
                 QueueChanged?.Invoke();
@@ -511,6 +1076,36 @@ namespace com.amari_noa.unitypackage_pipeline_core.editor
             {
                 Debug.LogError($"{AmariUnityPackagePipelineLabels.LogPrefix} QueueChanged callback failed: {ex.Message}");
             }
+        }
+
+        private void OnBeforeAssemblyReload()
+        {
+            PersistStateNow();
+        }
+
+        private void OnEditorQuitting()
+        {
+            PersistStateNow();
+        }
+
+        private void Log(string message)
+        {
+            if (_quietMode)
+            {
+                return;
+            }
+
+            Debug.Log($"{AmariUnityPackagePipelineLabels.LogPrefix} {message}");
+        }
+
+        private void LogWarning(string message)
+        {
+            if (_quietMode)
+            {
+                return;
+            }
+
+            Debug.LogWarning($"{AmariUnityPackagePipelineLabels.LogPrefix} {message}");
         }
     }
 }

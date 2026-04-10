@@ -5,6 +5,7 @@ namespace com.amari_noa.unitypackage_pipeline_core.editor
 {
     public sealed class AmariUnityPackageImportEventBridge : IDisposable
     {
+        public event Action<string> ImportStarted;
         public event Action<string> ImportCompleted;
         public event Action<string, string> ImportFailed;
         public event Action<string> ImportCancelled;
@@ -19,6 +20,7 @@ namespace com.amari_noa.unitypackage_pipeline_core.editor
                 return;
             }
 
+            AssetDatabase.importPackageStarted += OnImportStarted;
             AssetDatabase.importPackageCompleted += OnImportCompleted;
             AssetDatabase.importPackageFailed += OnImportFailed;
             AssetDatabase.importPackageCancelled += OnImportCancelled;
@@ -33,6 +35,7 @@ namespace com.amari_noa.unitypackage_pipeline_core.editor
                 return;
             }
 
+            AssetDatabase.importPackageStarted -= OnImportStarted;
             AssetDatabase.importPackageCompleted -= OnImportCompleted;
             AssetDatabase.importPackageFailed -= OnImportFailed;
             AssetDatabase.importPackageCancelled -= OnImportCancelled;
@@ -43,6 +46,11 @@ namespace com.amari_noa.unitypackage_pipeline_core.editor
         public void Dispose()
         {
             Unsubscribe();
+        }
+
+        private void OnImportStarted(string packageName)
+        {
+            ImportStarted?.Invoke(packageName);
         }
 
         private void OnImportCompleted(string packageName)

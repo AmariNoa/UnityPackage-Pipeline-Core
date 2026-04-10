@@ -15,6 +15,8 @@ namespace com.amari_noa.unitypackage_pipeline_core.editor
         int RemainingCount { get; }
         string[] CurrentTags { get; }
         bool InteractiveMode { get; set; }
+        AmariUnityPackagePreImportAnalysisMode PreImportAnalysisMode { get; set; }
+        bool QuietMode { get; set; }
 
         event Action<AmariUnityPackageImportResultContext> ImportRequestFinalized;
         event Action QueueChanged;
