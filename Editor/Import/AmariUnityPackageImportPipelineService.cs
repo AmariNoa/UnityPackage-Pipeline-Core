@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using UnityEditor;
 using UnityEngine;
 using UnityEngine.UIElements;
@@ -20,7 +21,10 @@ namespace com.amari_noa.unitypackage_pipeline_core.editor
     public sealed class AmariUnityPackageImportPipelineService : IAmariUnityPackageImportPipelineService, IDisposable
     {
         private const int PersistStateDebounceMilliseconds = 500;
-        private const int ClosedWindowFallbackDecisionFrames = 30;
+        private const int CloseFallbackRequiredNoWindowFrames = 10;
+        private const int CloseFallbackRequiredNoWindowMilliseconds = 200;
+        private const int AbsoluteHangTimeoutMilliseconds = 60000;
+        private static bool EnablePrefLog = true;
         private static readonly string[] PackageImportWindowTypeNames =
         {
             "UnityEditor.PackageImport",
@@ -55,11 +59,18 @@ namespace com.amari_noa.unitypackage_pipeline_core.editor
         private bool _currentRequestTerminalEventReceived;
         private bool _currentRequestObservedPackageImportWindowOpen;
         private bool _currentRequestObservedPackageImportWindowClose;
-        private int _currentRequestWindowClosedWithoutTerminalEventUpdateCount;
+        private bool _currentRequestCloseCandidateActive;
+        private int _currentRequestCloseCandidateNoWindowFrames;
+        private long _currentRequestCloseCandidateStartUtcTicks;
+        private PackageImportWindowKeyboardHint _currentRequestKeyboardHint;
+        private bool _currentRequestImportConfirmedByKeyboard;
+        private long _currentRequestStartUtcTicks;
         private readonly HashSet<int> _trackedPackageImportWindowIds = new HashSet<int>();
         private readonly Dictionary<int, VisualElement> _trackedPackageImportWindowRoots = new Dictionary<int, VisualElement>();
         private readonly Dictionary<int, EventCallback<DetachFromPanelEvent>> _trackedPackageImportWindowDetachCallbacks =
             new Dictionary<int, EventCallback<DetachFromPanelEvent>>();
+        private readonly Dictionary<int, EventCallback<KeyDownEvent>> _trackedPackageImportWindowKeyDownCallbacks =
+            new Dictionary<int, EventCallback<KeyDownEvent>>();
 
         public bool IsImporting => _isImporting;
         public int RemainingCount => _queue.Count;
@@ -192,6 +203,7 @@ namespace com.amari_noa.unitypackage_pipeline_core.editor
                 return;
             }
 
+            PrefLog($"StartImport called. isImporting={_isImporting}, runnerIsRunning={_runner.IsRunning}, queueCount={_queue.Count}");
             RecoverStaleImportStateIfNeeded("StartImport");
 
             if (_isImporting || _runner.IsRunning)
@@ -239,7 +251,8 @@ namespace com.amari_noa.unitypackage_pipeline_core.editor
                     AmariUnityPackagePipelineOperationStatus.Cancelled,
                     "Import queue reset by pipeline request.",
                     clearRemainingQueue: true,
-                    reason: nameof(ResetPipelineAndClearQueue)))
+                    reason: nameof(ResetPipelineAndClearQueue),
+                    cancellationReason: AmariUnityPackageImportCancellationReason.PipelineReset))
             {
                 LogWarning(
                     $"Pipeline reset finalized active request. remainingBefore={remainingBefore}, " +
@@ -375,16 +388,19 @@ namespace com.amari_noa.unitypackage_pipeline_core.editor
 
         private void TryStartCurrentRequest()
         {
+            PrefLog($"TryStartCurrentRequest entered. queueCount={_queue.Count}, interactiveMode={_interactiveMode}, preImportAnalysisMode={_preImportAnalysisMode}");
             if (!_queue.TryPeek(out var request))
             {
                 _isImporting = false;
                 PersistStateNow();
                 RaiseQueueChanged();
+                PrefLog("TryStartCurrentRequest aborted: queue empty.");
                 return;
             }
 
             if (!_tagValidator.TryNormalizeAndValidate(request.Tags, out var normalizedTags, out var validationError))
             {
+                PrefLog($"TryStartCurrentRequest tag validation failed. packagePath={request.PackagePath}, error={validationError}");
                 _currentContext = new AmariUnityPackageImportContext(request, Array.Empty<string>(), _interactiveMode);
                 _currentTags = Array.Empty<string>();
                 BeginCurrentRequestLifecycleState();
@@ -399,6 +415,7 @@ namespace com.amari_noa.unitypackage_pipeline_core.editor
             if (_preImportAnalysisMode != AmariUnityPackagePreImportAnalysisMode.Skip &&
                 TryFinalizeNoChangeRequest(request, normalizedTags))
             {
+                PrefLog($"TryStartCurrentRequest finalized by pre-import no-change. packagePath={request.PackagePath}");
                 return;
             }
 
@@ -411,13 +428,28 @@ namespace com.amari_noa.unitypackage_pipeline_core.editor
             _isImporting = true;
             PersistState();
             RaiseQueueChanged();
-            BeginInteractiveImportWindowMonitor();
-
-            if (_runner.TryStartImport(request.PackagePath, _interactiveMode, out var startError))
+            var interactiveMonitorReady = BeginInteractiveImportWindowMonitor();
+            if (_interactiveMode && !interactiveMonitorReady)
             {
+                const string monitorError = "Failed to resolve Package Import window types for interactive import monitoring.";
+                PrefLog($"TryStartCurrentRequest failed before import start. packagePath={request.PackagePath}, error={monitorError}");
+                TryFinalizeCurrentRequest(
+                    AmariUnityPackagePipelineOperationStatus.Failed,
+                    monitorError,
+                    clearRemainingQueue: false,
+                    reason: "PackageImportWindowTypesUnresolved");
                 return;
             }
 
+            PrefLog($"TryStartCurrentRequest starting import. packagePath={request.PackagePath}, interactive={_interactiveMode}");
+
+            if (_runner.TryStartImport(request.PackagePath, _interactiveMode, out var startError))
+            {
+                PrefLog($"TryStartCurrentRequest import started. packagePath={request.PackagePath}");
+                return;
+            }
+
+            PrefLog($"TryStartCurrentRequest failed to start import. packagePath={request.PackagePath}, error={startError}");
             TryFinalizeCurrentRequest(
                 AmariUnityPackagePipelineOperationStatus.Failed,
                 startError,
@@ -429,15 +461,23 @@ namespace com.amari_noa.unitypackage_pipeline_core.editor
         {
             if (!_isImporting || _currentContext == null)
             {
+                PrefLog(
+                    $"OnImportCompleted ignored. packageName={packageName}, isImporting={_isImporting}, " +
+                    $"hasContext={(_currentContext != null)}, currentPackagePath={_currentContext?.Request?.PackagePath ?? string.Empty}");
                 return;
             }
 
+            PrefLog(
+                $"OnImportCompleted received. packageName={packageName}, " +
+                $"currentPackagePath={_currentContext.Request?.PackagePath ?? string.Empty}");
             _currentRequestTerminalEventReceived = true;
+            ClearCurrentRequestKeyboardHint();
             _hookDispatcher.DispatchCompleted(_currentContext);
 
             var importedAssets = _assetTracker.GetImportedAssetsSnapshot();
             if (!_tagService.TryApplyTags(importedAssets, _currentTags, out var tagError))
             {
+                PrefLog($"OnImportCompleted tag apply failed. packageName={packageName}, error={tagError}");
                 TryFinalizeCurrentRequest(
                     AmariUnityPackagePipelineOperationStatus.Failed,
                     tagError,
@@ -457,10 +497,17 @@ namespace com.amari_noa.unitypackage_pipeline_core.editor
         {
             if (!_isImporting || _currentContext == null)
             {
+                PrefLog(
+                    $"OnImportFailed ignored. packageName={packageName}, error={error}, isImporting={_isImporting}, " +
+                    $"hasContext={(_currentContext != null)}, currentPackagePath={_currentContext?.Request?.PackagePath ?? string.Empty}");
                 return;
             }
 
+            PrefLog(
+                $"OnImportFailed received. packageName={packageName}, error={error}, " +
+                $"currentPackagePath={_currentContext.Request?.PackagePath ?? string.Empty}");
             _currentRequestTerminalEventReceived = true;
+            ClearCurrentRequestKeyboardHint();
             var message = string.IsNullOrWhiteSpace(error)
                 ? $"Import failed: {packageName}"
                 : error;
@@ -475,9 +522,15 @@ namespace com.amari_noa.unitypackage_pipeline_core.editor
         {
             if (!_isImporting || _currentContext == null)
             {
+                PrefLog(
+                    $"OnImportStarted ignored. packageName={packageName}, isImporting={_isImporting}, " +
+                    $"hasContext={(_currentContext != null)}, currentPackagePath={_currentContext?.Request?.PackagePath ?? string.Empty}");
                 return;
             }
 
+            PrefLog(
+                $"OnImportStarted received. packageName={packageName}, " +
+                $"currentPackagePath={_currentContext.Request?.PackagePath ?? string.Empty}");
             _ = packageName;
             // importPackageStarted can fire before the user confirms Import,
             // so it must not suppress the close-window fallback.
@@ -487,51 +540,83 @@ namespace com.amari_noa.unitypackage_pipeline_core.editor
         {
             if (!_isImporting || _currentContext == null)
             {
+                PrefLog(
+                    $"OnImportCancelled ignored. packageName={packageName}, isImporting={_isImporting}, " +
+                    $"hasContext={(_currentContext != null)}, currentPackagePath={_currentContext?.Request?.PackagePath ?? string.Empty}");
                 return;
             }
 
+            PrefLog(
+                $"OnImportCancelled received. packageName={packageName}, " +
+                $"currentPackagePath={_currentContext.Request?.PackagePath ?? string.Empty}");
             _currentRequestTerminalEventReceived = true;
-            var message = string.IsNullOrWhiteSpace(packageName)
-                ? "Import cancelled."
-                : $"Import cancelled: {packageName}";
+            ClearCurrentRequestKeyboardHint();
+            var message = BuildImportCancelledMessage(packageName);
             TryFinalizeCurrentRequest(
                 AmariUnityPackagePipelineOperationStatus.Cancelled,
                 message,
                 clearRemainingQueue: true,
-                reason: "ImportCancelled");
+                reason: "ImportCancelled",
+                cancellationReason: AmariUnityPackageImportCancellationReason.UnityCancelledEvent);
         }
 
         private void OnAssetsPostprocessed(string[] importedAssets)
         {
             if (!_isImporting || _currentContext == null)
             {
+                PrefLog(
+                    $"OnAssetsPostprocessed ignored. importedAssetsCount={(importedAssets == null ? 0 : importedAssets.Length)}, " +
+                    $"isImporting={_isImporting}, hasContext={(_currentContext != null)}, " +
+                    $"currentPackagePath={_currentContext?.Request?.PackagePath ?? string.Empty}");
                 return;
             }
 
+            PrefLog(
+                $"OnAssetsPostprocessed received. importedAssetsCount={(importedAssets == null ? 0 : importedAssets.Length)}, " +
+                $"currentPackagePath={_currentContext.Request?.PackagePath ?? string.Empty}");
             _currentRequestImportExecutionObserved = true;
             _assetTracker.RecordImportedAssets(importedAssets);
         }
 
         private void BeginCurrentRequestLifecycleState()
         {
+            PrefLog(
+                $"BeginCurrentRequestLifecycleState reset flags. " +
+                $"currentPackagePath={_currentContext?.Request?.PackagePath ?? string.Empty}, queueCount={_queue.Count}");
             StopInteractiveImportWindowMonitor();
             _currentRequestFinalized = false;
             _currentRequestImportExecutionObserved = false;
             _currentRequestTerminalEventReceived = false;
             _currentRequestObservedPackageImportWindowOpen = false;
             _currentRequestObservedPackageImportWindowClose = false;
-            _currentRequestWindowClosedWithoutTerminalEventUpdateCount = 0;
+            ResetCloseFallbackCandidateState();
+            ClearCurrentRequestKeyboardHint();
+            _currentRequestImportConfirmedByKeyboard = false;
+            _currentRequestStartUtcTicks = DateTime.UtcNow.Ticks;
         }
 
         private bool TryFinalizeCurrentRequest(
             AmariUnityPackagePipelineOperationStatus status,
             string errorMessage,
             bool clearRemainingQueue,
-            string reason)
+            string reason,
+            AmariUnityPackageImportCancellationReason cancellationReason = AmariUnityPackageImportCancellationReason.None)
         {
-            _ = reason;
+            if (status != AmariUnityPackagePipelineOperationStatus.Cancelled)
+            {
+                cancellationReason = AmariUnityPackageImportCancellationReason.None;
+            }
+
+            PrefLog(
+                $"TryFinalizeCurrentRequest requested. status={status}, clearRemainingQueue={clearRemainingQueue}, " +
+                $"reason={reason}, error={errorMessage}, cancellationReason={cancellationReason}, " +
+                $"currentPackagePath={_currentContext?.Request?.PackagePath ?? string.Empty}, " +
+                $"queueHeadPackagePath={(_queue.TryPeek(out var queueHeadForLog) ? queueHeadForLog.PackagePath : string.Empty)}, " +
+                $"observedWindowOpen={_currentRequestObservedPackageImportWindowOpen}, observedWindowClose={_currentRequestObservedPackageImportWindowClose}, " +
+                $"terminalEventReceived={_currentRequestTerminalEventReceived}, importExecutionObserved={_currentRequestImportExecutionObserved}");
             if (_currentRequestFinalized)
             {
+                PrefLog("TryFinalizeCurrentRequest skipped: already finalized.");
                 return false;
             }
 
@@ -542,24 +627,32 @@ namespace com.amari_noa.unitypackage_pipeline_core.editor
 
             if (_currentContext == null)
             {
+                PrefLog("TryFinalizeCurrentRequest skipped: current context unavailable.");
                 return false;
             }
 
             _currentRequestFinalized = true;
-            FinalizeCurrentRequest(status, errorMessage, clearRemainingQueue);
+            FinalizeCurrentRequest(status, errorMessage, clearRemainingQueue, cancellationReason);
             return true;
         }
 
         private void FinalizeCurrentRequest(
             AmariUnityPackagePipelineOperationStatus status,
             string errorMessage,
-            bool clearRemainingQueue = false)
+            bool clearRemainingQueue = false,
+            AmariUnityPackageImportCancellationReason cancellationReason = AmariUnityPackageImportCancellationReason.None)
         {
+            PrefLog(
+                $"FinalizeCurrentRequest begin. status={status}, clearRemainingQueue={clearRemainingQueue}, " +
+                $"queueCountBefore={_queue.Count}, currentPackagePath={_currentContext?.Request?.PackagePath ?? string.Empty}");
             if (!_queue.TryPeek(out var request))
             {
                 CleanupCurrentRequestState();
+                PrefLog("FinalizeCurrentRequest: queue empty during finalize.");
                 return;
             }
+
+            PrefLog($"FinalizeCurrentRequest queue head. requestPackagePath={request.PackagePath}");
 
             var importedAssets = _assetTracker.GetImportedAssetsSnapshot();
             var resultContext = new AmariUnityPackageImportResultContext(
@@ -567,7 +660,8 @@ namespace com.amari_noa.unitypackage_pipeline_core.editor
                 _currentTags,
                 importedAssets,
                 status,
-                errorMessage);
+                errorMessage,
+                cancellationReason);
 
             _hookDispatcher.DispatchFinalized(resultContext);
             var notifyOk = _notifier.TryNotifyFinalized(resultContext, out var notificationError);
@@ -581,6 +675,7 @@ namespace com.amari_noa.unitypackage_pipeline_core.editor
             {
                 _queue.Clear();
                 LogWarning("Queue cleared due to cancelled package import.");
+                PrefLog("FinalizeCurrentRequest: cleared remaining queue.");
             }
 
             CleanupCurrentRequestState();
@@ -591,6 +686,7 @@ namespace com.amari_noa.unitypackage_pipeline_core.editor
                 notifyOk;
             if (shouldContinue && _queue.Count > 0)
             {
+                PrefLog($"FinalizeCurrentRequest: continue to next request. remainingQueue={_queue.Count}");
                 TryStartCurrentRequest();
                 return;
             }
@@ -598,11 +694,14 @@ namespace com.amari_noa.unitypackage_pipeline_core.editor
             if (!shouldContinue && _queue.Count > 0)
             {
                 LogWarning($"Queue stopped due to import error. Remaining requests: {_queue.Count}");
+                PrefLog($"FinalizeCurrentRequest: queue stopped. remainingQueue={_queue.Count}");
             }
         }
 
         private void CleanupCurrentRequestState()
         {
+            var previousPackagePath = _currentContext?.Request?.PackagePath ?? string.Empty;
+            PrefLog($"CleanupCurrentRequestState reset state. previousPackagePath={previousPackagePath}, queueCount={_queue.Count}");
             StopInteractiveImportWindowMonitor();
             _runner.CompleteCurrent();
             _assetTracker.EndTracking();
@@ -614,41 +713,63 @@ namespace com.amari_noa.unitypackage_pipeline_core.editor
             _currentRequestTerminalEventReceived = false;
             _currentRequestObservedPackageImportWindowOpen = false;
             _currentRequestObservedPackageImportWindowClose = false;
-            _currentRequestWindowClosedWithoutTerminalEventUpdateCount = 0;
+            ResetCloseFallbackCandidateState();
+            ClearCurrentRequestKeyboardHint();
+            _currentRequestImportConfirmedByKeyboard = false;
+            _currentRequestStartUtcTicks = 0L;
             PersistStateNow();
             RaiseQueueChanged();
         }
 
-        private void BeginInteractiveImportWindowMonitor()
+        private bool BeginInteractiveImportWindowMonitor()
         {
             if (_isDisposed || !_interactiveMode)
             {
                 StopInteractiveImportWindowMonitor();
-                return;
+                PrefLog(
+                    $"BeginInteractiveImportWindowMonitor skipped. isDisposed={_isDisposed}, interactiveMode={_interactiveMode}, " +
+                    $"currentPackagePath={_currentContext?.Request?.PackagePath ?? string.Empty}");
+                return true;
             }
 
             ResolvePackageImportWindowTypes();
             if (_packageImportWindowTypes.Length == 0)
             {
                 StopInteractiveImportWindowMonitor();
-                return;
+                PrefLog(
+                    $"BeginInteractiveImportWindowMonitor skipped. packageImportWindowTypes unresolved. " +
+                    $"currentPackagePath={_currentContext?.Request?.PackagePath ?? string.Empty}");
+                return false;
             }
 
             if (_interactiveImportMonitorSubscribed)
             {
-                return;
+                PrefLog(
+                    $"BeginInteractiveImportWindowMonitor skipped: already subscribed. " +
+                    $"currentPackagePath={_currentContext?.Request?.PackagePath ?? string.Empty}");
+                return true;
             }
 
             EditorApplication.update += MonitorInteractiveImportWindow;
             _interactiveImportMonitorSubscribed = true;
+            PrefLog(
+                $"BeginInteractiveImportWindowMonitor subscribed. " +
+                $"currentPackagePath={_currentContext?.Request?.PackagePath ?? string.Empty}");
+            return true;
         }
 
         private void StopInteractiveImportWindowMonitor()
         {
+            PrefLog(
+                $"StopInteractiveImportWindowMonitor invoked. trackedWindowCount={_trackedPackageImportWindowIds.Count}, " +
+                $"currentPackagePath={_currentContext?.Request?.PackagePath ?? string.Empty}");
             StopTrackingPackageImportWindows(markClosedObserved: false);
             _currentRequestObservedPackageImportWindowOpen = false;
             _currentRequestObservedPackageImportWindowClose = false;
-            _currentRequestWindowClosedWithoutTerminalEventUpdateCount = 0;
+            ResetCloseFallbackCandidateState();
+            ClearCurrentRequestKeyboardHint();
+            _currentRequestImportConfirmedByKeyboard = false;
+            _currentRequestStartUtcTicks = 0L;
             if (!_interactiveImportMonitorSubscribed)
             {
                 return;
@@ -656,6 +777,7 @@ namespace com.amari_noa.unitypackage_pipeline_core.editor
 
             EditorApplication.update -= MonitorInteractiveImportWindow;
             _interactiveImportMonitorSubscribed = false;
+            PrefLog("StopInteractiveImportWindowMonitor unsubscribed.");
         }
 
         private void MonitorInteractiveImportWindow()
@@ -663,6 +785,9 @@ namespace com.amari_noa.unitypackage_pipeline_core.editor
             if (_isDisposed || !_isImporting || _currentContext == null || !_interactiveMode || _currentRequestFinalized)
             {
                 StopInteractiveImportWindowMonitor();
+                PrefLog(
+                    $"MonitorInteractiveImportWindow stopped by guard. isDisposed={_isDisposed}, isImporting={_isImporting}, " +
+                    $"hasContext={(_currentContext != null)}, interactiveMode={_interactiveMode}, currentRequestFinalized={_currentRequestFinalized}");
                 return;
             }
 
@@ -670,59 +795,233 @@ namespace com.amari_noa.unitypackage_pipeline_core.editor
             if (_packageImportWindowTypes.Length == 0)
             {
                 StopInteractiveImportWindowMonitor();
+                PrefLog("MonitorInteractiveImportWindow stopped: packageImportWindowTypes unresolved.");
                 return;
+            }
+
+            if (EditorApplication.isUpdating)
+            {
+                _currentRequestImportExecutionObserved = true;
             }
 
             var openWindows = GetOpenPackageImportWindows();
             SyncTrackedPackageImportWindows(openWindows);
             if (_trackedPackageImportWindowIds.Count > 0)
             {
-                _currentRequestObservedPackageImportWindowClose = false;
-                _currentRequestWindowClosedWithoutTerminalEventUpdateCount = 0;
+                ResetCloseFallbackCandidateState();
                 return;
+            }
+
+            if (!_currentRequestCloseCandidateActive &&
+                _currentRequestObservedPackageImportWindowOpen &&
+                _currentRequestObservedPackageImportWindowClose &&
+                !_currentRequestTerminalEventReceived &&
+                !_currentRequestImportExecutionObserved)
+            {
+                PrefLog(
+                    $"MonitorInteractiveImportWindow evaluating close fallback. openWindowCount={openWindows.Length}, " +
+                    $"currentPackagePath={_currentContext.Request?.PackagePath ?? string.Empty}, " +
+                    $"keyboardHint={_currentRequestKeyboardHint}");
             }
 
             if (_currentRequestTerminalEventReceived)
             {
                 StopInteractiveImportWindowMonitor();
+                PrefLog("MonitorInteractiveImportWindow stopped: terminal event already received.");
                 return;
             }
 
             if (_currentRequestImportExecutionObserved)
             {
                 StopInteractiveImportWindowMonitor();
+                PrefLog("MonitorInteractiveImportWindow stopped: import execution observed.");
                 return;
             }
 
-            // Keep waiting while Unity is actively importing/updating assets.
-            // This prevents premature fallback-cancel after pressing Import.
-            if (EditorApplication.isUpdating)
+            if (_currentRequestImportConfirmedByKeyboard)
             {
-                _currentRequestImportExecutionObserved = true;
-                _currentRequestWindowClosedWithoutTerminalEventUpdateCount = 0;
+                TryHandleCurrentRequestHangTimeout();
                 return;
             }
 
-            if (!_currentRequestObservedPackageImportWindowOpen || !_currentRequestObservedPackageImportWindowClose)
+            TryHandleCurrentRequestWindowCloseFallback();
+        }
+
+        private void TryHandleCurrentRequestWindowCloseFallback()
+        {
+            if (!_currentRequestObservedPackageImportWindowOpen ||
+                !_currentRequestObservedPackageImportWindowClose ||
+                _currentRequestTerminalEventReceived ||
+                _currentRequestImportExecutionObserved)
             {
-                _currentRequestWindowClosedWithoutTerminalEventUpdateCount = 0;
+                if (_currentRequestCloseCandidateActive)
+                {
+                    PrefLog(
+                        $"TryHandleCurrentRequestWindowCloseFallback reset candidate by guard. " +
+                        $"observedWindowOpen={_currentRequestObservedPackageImportWindowOpen}, " +
+                        $"observedWindowClose={_currentRequestObservedPackageImportWindowClose}, " +
+                        $"terminalEventReceived={_currentRequestTerminalEventReceived}, " +
+                        $"importExecutionObserved={_currentRequestImportExecutionObserved}, " +
+                        $"currentPackagePath={_currentContext?.Request?.PackagePath ?? string.Empty}");
+                }
+
+                ResetCloseFallbackCandidateState();
                 return;
             }
 
-            _currentRequestWindowClosedWithoutTerminalEventUpdateCount++;
-            if (_currentRequestWindowClosedWithoutTerminalEventUpdateCount < ClosedWindowFallbackDecisionFrames)
+            if (_currentRequestImportConfirmedByKeyboard)
+            {
+                PrefLog(
+                    $"TryHandleCurrentRequestWindowCloseFallback suppressed: import already confirmed by keyboard. " +
+                    $"currentPackagePath={_currentContext?.Request?.PackagePath ?? string.Empty}, " +
+                    $"keyboardHint={_currentRequestKeyboardHint}");
+                ResetCloseFallbackCandidateState();
+                return;
+            }
+
+            var nowTicks = DateTime.UtcNow.Ticks;
+            if (!_currentRequestCloseCandidateActive)
+            {
+                _currentRequestCloseCandidateActive = true;
+                _currentRequestCloseCandidateNoWindowFrames = 1;
+                _currentRequestCloseCandidateStartUtcTicks = nowTicks;
+                PrefLog(
+                    $"TryHandleCurrentRequestWindowCloseFallback started close candidate. " +
+                    $"currentPackagePath={_currentContext?.Request?.PackagePath ?? string.Empty}, " +
+                    $"keyboardHint={_currentRequestKeyboardHint}");
+                return;
+            }
+
+            _currentRequestCloseCandidateNoWindowFrames++;
+            var elapsedMilliseconds = 0d;
+            if (_currentRequestCloseCandidateStartUtcTicks > 0L)
+            {
+                elapsedMilliseconds = TimeSpan.FromTicks(nowTicks - _currentRequestCloseCandidateStartUtcTicks).TotalMilliseconds;
+            }
+
+            if (_currentRequestCloseCandidateNoWindowFrames < CloseFallbackRequiredNoWindowFrames ||
+                elapsedMilliseconds < CloseFallbackRequiredNoWindowMilliseconds)
             {
                 return;
             }
 
-            var message = string.IsNullOrWhiteSpace(_currentContext.Request?.PackagePath)
-                ? "Import cancelled by closing the Package Import window."
-                : $"Import cancelled by closing the Package Import window: {_currentContext.Request.PackagePath}";
+            PrefLog(
+                $"TryHandleCurrentRequestWindowCloseFallback finalized. " +
+                $"frames={_currentRequestCloseCandidateNoWindowFrames}, elapsedMs={elapsedMilliseconds:0}, " +
+                $"currentPackagePath={_currentContext?.Request?.PackagePath ?? string.Empty}, " +
+                $"keyboardHint={_currentRequestKeyboardHint}");
+            var message = BuildImportCancelledMessage(
+                Path.GetFileNameWithoutExtension(_currentContext?.Request?.PackagePath ?? string.Empty));
             TryFinalizeCurrentRequest(
                 AmariUnityPackagePipelineOperationStatus.Cancelled,
                 message,
                 clearRemainingQueue: true,
-                reason: "PackageImportWindowClosedWithoutTerminalEvent");
+                reason: "PackageImportWindowClosedFallback",
+                cancellationReason: AmariUnityPackageImportCancellationReason.WindowClosedFallback);
+        }
+
+        private void TryHandleCurrentRequestHangTimeout()
+        {
+            if (!_currentRequestImportConfirmedByKeyboard ||
+                _currentRequestTerminalEventReceived ||
+                _currentRequestImportExecutionObserved ||
+                _currentRequestStartUtcTicks <= 0L)
+            {
+                return;
+            }
+
+            var elapsedMilliseconds = TimeSpan
+                .FromTicks(DateTime.UtcNow.Ticks - _currentRequestStartUtcTicks)
+                .TotalMilliseconds;
+            if (elapsedMilliseconds < AbsoluteHangTimeoutMilliseconds)
+            {
+                return;
+            }
+
+            PrefLog(
+                $"TryHandleCurrentRequestHangTimeout finalized. elapsedMs={elapsedMilliseconds:0}, " +
+                $"currentPackagePath={_currentContext?.Request?.PackagePath ?? string.Empty}, " +
+                $"keyboardHint={_currentRequestKeyboardHint}");
+            var message = BuildImportCancelledMessage(
+                Path.GetFileNameWithoutExtension(_currentContext?.Request?.PackagePath ?? string.Empty));
+            TryFinalizeCurrentRequest(
+                AmariUnityPackagePipelineOperationStatus.Cancelled,
+                message,
+                clearRemainingQueue: true,
+                reason: "PackageImportHangTimeoutAfterImportConfirm",
+                cancellationReason: AmariUnityPackageImportCancellationReason.HangTimeoutAfterImportConfirm);
+        }
+
+        private void ResetCloseFallbackCandidateState()
+        {
+            _currentRequestCloseCandidateActive = false;
+            _currentRequestCloseCandidateNoWindowFrames = 0;
+            _currentRequestCloseCandidateStartUtcTicks = 0L;
+        }
+
+        private void ClearCurrentRequestKeyboardHint()
+        {
+            _currentRequestKeyboardHint = PackageImportWindowKeyboardHint.None;
+        }
+
+        private static bool TryResolvePackageImportWindowKeyboardHint(
+            KeyDownEvent evt,
+            out PackageImportWindowKeyboardHint hint)
+        {
+            hint = PackageImportWindowKeyboardHint.None;
+            if (evt == null || evt.ctrlKey || evt.altKey || evt.commandKey || evt.shiftKey)
+            {
+                return false;
+            }
+
+            if (IsTextInputTarget(evt.target))
+            {
+                return false;
+            }
+
+            if (evt.keyCode == KeyCode.Return || evt.keyCode == KeyCode.KeypadEnter)
+            {
+                hint = PackageImportWindowKeyboardHint.Import;
+                return true;
+            }
+
+            if (evt.keyCode == KeyCode.Escape)
+            {
+                hint = PackageImportWindowKeyboardHint.Cancel;
+                return true;
+            }
+
+            return false;
+        }
+
+        private static bool IsTextInputTarget(object eventTarget)
+        {
+            if (eventTarget is not VisualElement target)
+            {
+                return false;
+            }
+
+            var current = target;
+            while (current != null)
+            {
+                if (current is TextField ||
+                    current.ClassListContains("unity-base-text-field") ||
+                    current.ClassListContains("unity-text-field"))
+                {
+                    return true;
+                }
+
+                current = current.parent;
+            }
+
+            return false;
+        }
+
+        private static string BuildImportCancelledMessage(string packageName)
+        {
+            return string.IsNullOrWhiteSpace(packageName)
+                ? "Import cancelled."
+                : $"Import cancelled: {packageName}";
         }
 
         private UnityEngine.Object[] GetOpenPackageImportWindows()
@@ -805,31 +1104,6 @@ namespace com.amari_noa.unitypackage_pipeline_core.editor
                 }
             }
 
-            if (types.Count == 0)
-            {
-                try
-                {
-                    var editorAssemblyTypes = typeof(Editor).Assembly.GetTypes();
-                    for (var i = 0; i < editorAssemblyTypes.Length; i++)
-                    {
-                        var type = editorAssemblyTypes[i];
-                        if (type == null ||
-                            !typeof(EditorWindow).IsAssignableFrom(type) ||
-                            string.IsNullOrWhiteSpace(type.FullName) ||
-                            type.FullName.IndexOf("PackageImport", StringComparison.OrdinalIgnoreCase) < 0)
-                        {
-                            continue;
-                        }
-
-                        types.Add(type);
-                    }
-                }
-                catch
-                {
-                    // ignored
-                }
-            }
-
             _packageImportWindowTypes = types.ToArray();
         }
 
@@ -875,6 +1149,13 @@ namespace com.amari_noa.unitypackage_pipeline_core.editor
             {
                 UntrackPackageImportWindow(closedWindowIds[i], markClosedObserved: true);
             }
+
+            if (closedWindowIds.Count > 0)
+            {
+                PrefLog(
+                    $"SyncTrackedPackageImportWindows observed closed windows. closedCount={closedWindowIds.Count}, " +
+                    $"remainingTrackedCount={_trackedPackageImportWindowIds.Count}, currentPackagePath={_currentContext?.Request?.PackagePath ?? string.Empty}");
+            }
         }
 
         private void TrackPackageImportWindow(UnityEngine.Object windowObj, int windowId)
@@ -884,6 +1165,9 @@ namespace com.amari_noa.unitypackage_pipeline_core.editor
                 return;
             }
 
+            PrefLog(
+                $"TrackPackageImportWindow tracked. windowId={windowId}, windowType={windowObj?.GetType().FullName ?? string.Empty}, " +
+                $"currentPackagePath={_currentContext?.Request?.PackagePath ?? string.Empty}");
             _currentRequestObservedPackageImportWindowOpen = true;
 
             if (windowObj is not EditorWindow editorWindow)
@@ -898,14 +1182,48 @@ namespace com.amari_noa.unitypackage_pipeline_core.editor
             }
 
             EventCallback<DetachFromPanelEvent> detachCallback = _ => OnTrackedPackageImportWindowDetached(windowId);
+            EventCallback<KeyDownEvent> keyDownCallback = evt => OnTrackedPackageImportWindowKeyDown(windowId, evt);
             root.RegisterCallback(detachCallback);
+            root.RegisterCallback(keyDownCallback, TrickleDown.TrickleDown);
             _trackedPackageImportWindowRoots[windowId] = root;
             _trackedPackageImportWindowDetachCallbacks[windowId] = detachCallback;
+            _trackedPackageImportWindowKeyDownCallbacks[windowId] = keyDownCallback;
         }
 
         private void OnTrackedPackageImportWindowDetached(int windowId)
         {
+            PrefLog(
+                $"OnTrackedPackageImportWindowDetached. windowId={windowId}, " +
+                $"currentPackagePath={_currentContext?.Request?.PackagePath ?? string.Empty}");
             UntrackPackageImportWindow(windowId, markClosedObserved: true);
+        }
+
+        private void OnTrackedPackageImportWindowKeyDown(int windowId, KeyDownEvent evt)
+        {
+            if (evt == null ||
+                !_trackedPackageImportWindowIds.Contains(windowId) ||
+                _currentRequestFinalized ||
+                _currentContext == null)
+            {
+                return;
+            }
+
+            if (!TryResolvePackageImportWindowKeyboardHint(evt, out var hint) ||
+                hint == PackageImportWindowKeyboardHint.None)
+            {
+                return;
+            }
+
+            _currentRequestKeyboardHint = hint;
+            if (hint == PackageImportWindowKeyboardHint.Import)
+            {
+                _currentRequestImportConfirmedByKeyboard = true;
+            }
+
+            PrefLog(
+                $"OnTrackedPackageImportWindowKeyDown hint set. windowId={windowId}, hint={hint}, " +
+                $"keyCode={evt.keyCode}, importConfirmedByKeyboard={_currentRequestImportConfirmedByKeyboard}, " +
+                $"currentPackagePath={_currentContext?.Request?.PackagePath ?? string.Empty}");
         }
 
         private void UntrackPackageImportWindow(int windowId, bool markClosedObserved)
@@ -925,12 +1243,39 @@ namespace com.amari_noa.unitypackage_pipeline_core.editor
                 }
             }
 
+            if (_trackedPackageImportWindowRoots.TryGetValue(windowId, out var keyDownRoot) &&
+                _trackedPackageImportWindowKeyDownCallbacks.TryGetValue(windowId, out var keyDownCallback) &&
+                keyDownRoot != null &&
+                keyDownCallback != null)
+            {
+                try
+                {
+                    keyDownRoot.UnregisterCallback(keyDownCallback, TrickleDown.TrickleDown);
+                }
+                catch
+                {
+                    // ignored
+                }
+            }
+
             _trackedPackageImportWindowRoots.Remove(windowId);
             _trackedPackageImportWindowDetachCallbacks.Remove(windowId);
+            _trackedPackageImportWindowKeyDownCallbacks.Remove(windowId);
             var removed = _trackedPackageImportWindowIds.Remove(windowId);
             if (removed && markClosedObserved && _currentRequestObservedPackageImportWindowOpen)
             {
                 _currentRequestObservedPackageImportWindowClose = true;
+                PrefLog(
+                    $"UntrackPackageImportWindow marked close observed. windowId={windowId}, " +
+                    $"trackedWindowCount={_trackedPackageImportWindowIds.Count}, " +
+                    $"currentPackagePath={_currentContext?.Request?.PackagePath ?? string.Empty}");
+            }
+            else if (removed)
+            {
+                PrefLog(
+                    $"UntrackPackageImportWindow removed. windowId={windowId}, markClosedObserved={markClosedObserved}, " +
+                    $"trackedWindowCount={_trackedPackageImportWindowIds.Count}, " +
+                    $"currentPackagePath={_currentContext?.Request?.PackagePath ?? string.Empty}");
             }
         }
 
@@ -1086,6 +1431,23 @@ namespace com.amari_noa.unitypackage_pipeline_core.editor
         private void OnEditorQuitting()
         {
             PersistStateNow();
+        }
+
+        private static void PrefLog(string message)
+        {
+            if (!EnablePrefLog)
+            {
+                return;
+            }
+
+            Debug.Log($"{AmariUnityPackagePipelineLabels.LogPrefix} [PrefLog] {message}");
+        }
+
+        private enum PackageImportWindowKeyboardHint
+        {
+            None = 0,
+            Import = 1,
+            Cancel = 2
         }
 
         private void Log(string message)
