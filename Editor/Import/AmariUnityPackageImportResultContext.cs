@@ -12,6 +12,7 @@ namespace com.amari_noa.unitypackage_pipeline_core.editor
         public IReadOnlyList<string> ImportedAssets { get; }
         public AmariUnityPackagePipelineOperationStatus ImportStatus { get; }
         public AmariUnityPackageImportCancellationReason CancellationReason { get; }
+        public AmariUnityPackageImportFailureReason FailureReason { get; }
         public string ErrorMessage { get; }
         public bool IsCompleted => ImportStatus == AmariUnityPackagePipelineOperationStatus.Completed;
 
@@ -21,7 +22,8 @@ namespace com.amari_noa.unitypackage_pipeline_core.editor
             IEnumerable<string> importedAssets,
             AmariUnityPackagePipelineOperationStatus importStatus,
             string errorMessage,
-            AmariUnityPackageImportCancellationReason cancellationReason = AmariUnityPackageImportCancellationReason.None)
+            AmariUnityPackageImportCancellationReason cancellationReason = AmariUnityPackageImportCancellationReason.None,
+            AmariUnityPackageImportFailureReason failureReason = AmariUnityPackageImportFailureReason.None)
         {
             Request = request?.Clone() ?? throw new ArgumentNullException(nameof(request));
             PackagePath = Request.PackagePath;
@@ -40,6 +42,9 @@ namespace com.amari_noa.unitypackage_pipeline_core.editor
             CancellationReason = importStatus == AmariUnityPackagePipelineOperationStatus.Cancelled
                 ? cancellationReason
                 : AmariUnityPackageImportCancellationReason.None;
+            FailureReason = importStatus == AmariUnityPackagePipelineOperationStatus.Failed
+                ? failureReason
+                : AmariUnityPackageImportFailureReason.None;
             ErrorMessage = errorMessage ?? string.Empty;
         }
     }

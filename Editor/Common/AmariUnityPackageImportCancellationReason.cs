@@ -6,6 +6,7 @@ namespace com.amari_noa.unitypackage_pipeline_core.editor
         UnityCancelledEvent = 1,
         WindowClosedFallback = 2,
         PipelineReset = 3,
-        HangTimeoutAfterImportConfirm = 4
+        HangTimeoutAfterImportConfirm = 4,
+        StaleRecovery = 5
     }
 }
