@@ -23,7 +23,7 @@ namespace com.amari_noa.unitypackage_pipeline_core.editor
         private const int CloseFallbackRequiredNoWindowFrames = 10;
         private const int CloseFallbackRequiredNoWindowMilliseconds = 200;
         private const int AbsoluteHangTimeoutMilliseconds = 60000;
-        private static bool EnablePrefLog = true;
+        private static bool EnablePrefLog = false;
         private static readonly string[] PackageImportWindowTypeNames =
         {
             "UnityEditor.PackageImport",
